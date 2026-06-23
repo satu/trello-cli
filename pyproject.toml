@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trello-cli"
+version = "0.1.0"
+description = "Standalone, stdlib-only Trello command-line client (shared by trellm and humphrey)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "trello-cli Contributors" }
+]
+keywords = ["trello", "cli", "automation"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# Intentionally empty: the client is stdlib-only (urllib + json + yaml). PyYAML
+# is added in card 2/4 when config loading lands; the scaffold has no runtime deps.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[project.scripts]
+trello = "trello_cli.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["trello_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

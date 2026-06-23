@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv lockfile — kept untracked (matches trellm/dixit); the package builds with
+# pip + hatchling, so a stray uv.lock from local `uv` use is not a build input.
+uv.lock
