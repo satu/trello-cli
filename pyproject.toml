@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "trello-cli"
 version = "0.1.0"
-description = "Standalone, stdlib-only Trello command-line client (shared by trellm and humphrey)"
+description = "Standalone, dependency-light Trello command-line client (shared by trellm and humphrey)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["trello", "cli", "automation"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
@@ -23,9 +23,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-# Intentionally empty: the client is stdlib-only (urllib + json + yaml). PyYAML
-# is added in card 2/4 when config loading lands; the scaffold has no runtime deps.
-dependencies = []
+# The client itself is stdlib-only (urllib + json); PyYAML is the sole runtime
+# dependency and is imported lazily — only when an actual YAML config file is
+# read, so pure-env usage works even without it installed.
+dependencies = [
+    "PyYAML>=5.1",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -37,6 +40,9 @@ trello = "trello_cli.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["trello_cli"]
+# Ship the agent workflow docs (the /trello skill) inside the wheel so an
+# `pip install`/`uv tool install` lands the workflow, not just the binary.
+force-include = { "skills" = "trello_cli/skills" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
