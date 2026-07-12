@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -60,6 +62,12 @@ _SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,5}$")
 # link-attachment to an attacker host must NOT receive our creds (credential
 # exfil).
 _TRELLO_DOWNLOAD_HOSTS = {"api.trello.com", "trello.com"}
+
+# CR/LF/`"` are stripped from an attach command's --name/--mime before they're
+# embedded in a hand-built multipart header line: a raw CR/LF there would
+# inject an extra header/part into the body, and a raw `"` would break out of
+# the quoted filename="..." attribute.
+_UNSAFE_HEADER_CHARS_RE = re.compile(r'[\r\n"]')
 
 
 class TrelloError(Exception):
@@ -254,6 +262,78 @@ def _do_download(url: str, headers: dict) -> bytes:
         raise TrelloError(f"Network error downloading {url}: {exc.reason}") from exc
 
 
+def _do_upload(url: str, headers: dict, body: bytes) -> Any:
+    """POST a pre-built ``multipart/form-data`` body and return parsed JSON.
+
+    Isolated (like :func:`_do_http` / :func:`_do_download`) so tests can
+    monkeypatch the network away.
+    """
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise TrelloError(f"Trello upload {exc.code} on POST {url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise TrelloError(f"Network error uploading to {url}: {exc.reason}") from exc
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _safe_filename(name: str) -> str:
+    """Reduce ``name`` to a bare filename safe to embed in a multipart header.
+
+    Drops any directory components (``attach``'s ``--name`` / the local
+    file's own path shouldn't be able to smuggle one in) and strips
+    characters that could break out of the header line (see
+    ``_UNSAFE_HEADER_CHARS_RE``). Falls back to ``"file"`` if nothing is left.
+    """
+    base = os.path.basename((name or "").strip())
+    cleaned = _UNSAFE_HEADER_CHARS_RE.sub("", base)
+    return cleaned or "file"
+
+
+def _safe_mime(mime: str) -> str:
+    """Strip header-injection characters from a caller-supplied MIME type."""
+    return _UNSAFE_HEADER_CHARS_RE.sub("", (mime or "").strip())
+
+
+def _encode_multipart_form(
+    fields: dict, file_field: str, filename: str, content: bytes, content_type: str
+) -> tuple[bytes, str]:
+    """Build a ``multipart/form-data`` body: ``fields`` plus one file part.
+
+    Trello's attachment upload only accepts a multipart body (the
+    query-string key/token auth used by the rest of the JSON API is rejected
+    for this write — see :meth:`TrelloAPI.add_attachment`), so this is built
+    by hand rather than via ``urllib.parse.urlencode``.
+    """
+    boundary = f"trellocli-{secrets.token_hex(16)}"
+    parts = []
+    for field_name, value in fields.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field_name}"\r\n\r\n'
+            f"{value}\r\n".encode()
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode()
+    )
+    parts.append(content)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), boundary
+
+
 def _safe_suffix(url: str) -> str:
     """Derive a safe file-extension suffix (e.g. ``.opus``) from ``url``'s path.
 
@@ -439,6 +519,49 @@ class TrelloAPI:
             fh.write(data)
         return output_path, len(data)
 
+    def add_attachment(
+        self, card_id: str, path: str, name: Optional[str] = None, mime: Optional[str] = None
+    ) -> dict:
+        """Upload a local file as a native Trello card attachment.
+
+        POSTs ``multipart/form-data`` to ``/cards/{id}/attachments`` with the
+        OAuth ``Authorization`` header: Trello rejects the query-string
+        key/token auth the rest of the JSON API accepts for this particular
+        write. An explicit ``name`` form field is sent alongside the file
+        part's own filename so the attachment isn't left unnamed if an
+        intermediary drops the filename; ``mimeType`` is likewise sent as its
+        own form field when given, since the file part's ``Content-Type``
+        header alone doesn't reliably set it (Trello returned
+        ``mimeType: null`` for a ``text/html`` upload when only the header
+        carried it).
+
+        ``name``/``mime`` are caller-supplied, so both are sanitised
+        (``_safe_filename`` / ``_safe_mime``) before being embedded in the
+        hand-built multipart headers.
+        """
+        try:
+            content = Path(path).read_bytes()
+        except OSError as exc:
+            raise TrelloError(f"could not read {path!r}: {exc.strerror or exc}") from exc
+        filename = _safe_filename(name or Path(path).name)
+        fields = {"name": filename}
+        if mime:
+            content_type = _safe_mime(mime)
+            fields["mimeType"] = content_type
+        else:
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        body, boundary = _encode_multipart_form(fields, "file", filename, content, content_type)
+        headers = {
+            "Authorization": (
+                f'OAuth oauth_consumer_key="{self.creds.api_key}", '
+                f'oauth_token="{self.creds.api_token}"'
+            ),
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        url = f"{self.BASE}/cards/{card_id}/attachments"
+        return _do_upload(url, headers, body)
+
 
 # --- CLI ------------------------------------------------------------------
 
@@ -505,6 +628,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "temp file (owner-only, unpredictable name) and print its path.",
     )
 
+    sp = sub.add_parser(
+        "attach", help="Upload a local file as an attachment to a card."
+    )
+    sp.add_argument("card_id")
+    sp.add_argument("path", help="Local file path to upload.")
+    sp.add_argument(
+        "--name", help="Attachment name (default: the file's basename)."
+    )
+    sp.add_argument(
+        "--mime",
+        help="MIME type to record for the attachment (default: guessed from "
+        "the filename).",
+    )
+
     return p
 
 
@@ -551,6 +688,11 @@ def main(argv: Optional[list] = None) -> int:
                 print(path)
             else:
                 print(f"Saved {n} bytes to {path}")
+        elif args.command == "attach":
+            attachment = api.add_attachment(
+                args.card_id, args.path, name=args.name, mime=args.mime
+            )
+            print(f"Attached: {attachment.get('url') or attachment.get('id')}")
         else:  # pragma: no cover - argparse enforces a valid command
             parser.error(f"unknown command {args.command!r}")
     except TrelloError as exc:

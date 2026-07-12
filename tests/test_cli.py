@@ -6,9 +6,12 @@ these tests assert on the method/URL each command issues and how it shapes
 output — without ever touching the network.
 """
 
+import email
 import json
+import re
 import subprocess
 import sys
+from email import policy
 
 import pytest
 
@@ -588,3 +591,199 @@ class TestDownloadSecureTempPath:
         assert f("https://trello.com/x/noext") == ""
         assert f("https://trello.com/x/weird.tar.gz") == ".gz"
         assert f("https://trello.com/x/bad.toolongext") == ""
+
+
+# --- attach -----------------------------------------------------------
+
+
+def _parse_multipart(content_type: str, body: bytes) -> dict:
+    """Decode a ``multipart/form-data`` body into ``{field_name: part}``.
+
+    Used only by tests, to assert on exactly what a real HTTP client would
+    see rather than grepping for substrings in the raw bytes.
+    """
+    msg = email.message_from_bytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body,
+        policy=policy.default,
+    )
+    fields = {}
+    for part in msg.iter_parts():
+        cd = part.get("Content-Disposition", "")
+        name = re.search(r'name="([^"]*)"', cd).group(1)
+        filename_match = re.search(r'filename="([^"]*)"', cd)
+        fields[name] = {
+            "filename": filename_match.group(1) if filename_match else None,
+            "content_type": part.get_content_type(),
+            "payload": part.get_payload(decode=True),
+        }
+    return fields
+
+
+class TestAttachCommand:
+    """`trello attach` uploads a local file as a native Trello attachment.
+
+    Trello gates this write behind an OAuth ``Authorization`` header (the
+    query-string key/token used elsewhere is rejected for uploads), so it has
+    its own network seam (``_do_upload``), the same way ``download`` has
+    ``_do_download``.
+    """
+
+    def _patch(self, monkeypatch, response=None):
+        calls = []
+
+        def fake(url, headers, body):
+            calls.append((url, headers, body))
+            return response or {
+                "id": "ATT1",
+                "name": "file.txt",
+                "url": "https://trello.com/1/cards/CARD/attachments/ATT1",
+                "mimeType": None,
+            }
+
+        monkeypatch.setattr(cli, "_do_upload", fake)
+        monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
+        return calls
+
+    def test_uploads_file_with_oauth_header_not_query_string(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        calls = self._patch(monkeypatch)
+        f = tmp_path / "index.html"
+        f.write_text("<html></html>")
+        code, out = _run(["attach", "CARD", str(f)], capsys)
+        assert code == 0
+        assert "attachments/ATT1" in out
+        url, headers, body = calls[-1]
+        assert url == f"{cli.TrelloAPI.BASE}/cards/CARD/attachments"
+        assert "key=" not in url and "token=" not in url
+        auth = headers.get("Authorization", "")
+        assert "OAuth" in auth and "KEY" in auth and "TOK" in auth
+
+    def test_multipart_body_is_well_formed(self, monkeypatch, tmp_path, capsys):
+        calls = self._patch(monkeypatch)
+        f = tmp_path / "index.html"
+        f.write_text("<html>hi</html>")
+        code, _ = _run(["attach", "CARD", str(f)], capsys)
+        assert code == 0
+        _, headers, body = calls[-1]
+        fields = _parse_multipart(headers["Content-Type"], body)
+        assert fields["name"]["payload"] == b"index.html"
+        assert fields["file"]["filename"] == "index.html"
+        assert fields["file"]["payload"] == b"<html>hi</html>"
+
+    def test_default_name_is_file_basename(self, monkeypatch, tmp_path, capsys):
+        calls = self._patch(monkeypatch)
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4")
+        code, _ = _run(["attach", "CARD", str(f)], capsys)
+        assert code == 0
+        _, headers, body = calls[-1]
+        fields = _parse_multipart(headers["Content-Type"], body)
+        assert fields["name"]["payload"] == b"report.pdf"
+        assert fields["file"]["filename"] == "report.pdf"
+        assert fields["file"]["payload"] == b"%PDF-1.4"
+
+    def test_explicit_name_overrides_basename(self, monkeypatch, tmp_path, capsys):
+        calls = self._patch(monkeypatch)
+        f = tmp_path / "index.html"
+        f.write_text("data")
+        code, _ = _run(["attach", "CARD", str(f), "--name", "renamed.html"], capsys)
+        assert code == 0
+        _, headers, body = calls[-1]
+        fields = _parse_multipart(headers["Content-Type"], body)
+        assert fields["name"]["payload"] == b"renamed.html"
+        assert fields["file"]["filename"] == "renamed.html"
+
+    def test_explicit_mime_sent_as_its_own_form_field(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # Card note: Trello returned `mimeType: null` for a text/html upload
+        # even with the file part's Content-Type header set — an explicit
+        # `mimeType` form field is what actually needs to carry it.
+        calls = self._patch(monkeypatch)
+        f = tmp_path / "data.bin"
+        f.write_bytes(b"\x00\x01")
+        code, _ = _run(["attach", "CARD", str(f), "--mime", "text/html"], capsys)
+        assert code == 0
+        _, headers, body = calls[-1]
+        fields = _parse_multipart(headers["Content-Type"], body)
+        assert fields["mimeType"]["payload"] == b"text/html"
+        assert fields["file"]["content_type"] == "text/html"
+
+    def test_no_mime_flag_omits_mime_type_field(self, monkeypatch, tmp_path, capsys):
+        calls = self._patch(monkeypatch)
+        f = tmp_path / "plain.txt"
+        f.write_text("hi")
+        code, _ = _run(["attach", "CARD", str(f)], capsys)
+        assert code == 0
+        _, headers, body = calls[-1]
+        fields = _parse_multipart(headers["Content-Type"], body)
+        assert "mimeType" not in fields
+
+    def test_missing_file_returns_1(self, monkeypatch, tmp_path, capsys):
+        self._patch(monkeypatch)
+        code = cli.main(["attach", "CARD", str(tmp_path / "nope.txt")])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "nope.txt" in err
+
+    def test_upload_http_error_returns_1(self, monkeypatch, tmp_path, capsys):
+        def boom(url, headers, body):
+            raise cli.TrelloError("Trello upload 401 on POST ...: unauthorized")
+
+        monkeypatch.setattr(cli, "_do_upload", boom)
+        monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
+        f = tmp_path / "f.txt"
+        f.write_text("x")
+        code = cli.main(["attach", "CARD", str(f)])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "401" in err
+
+
+class TestAttachSanitization:
+    """``name``/``mime`` are caller-supplied and end up embedded in raw
+    multipart header lines, so they are sanitised against directory
+    components and CR/LF/quote header-injection."""
+
+    def test_safe_filename_strips_directory_components(self):
+        assert cli._safe_filename("../../etc/passwd") == "passwd"
+        assert cli._safe_filename("/abs/path/report.pdf") == "report.pdf"
+
+    def test_safe_filename_strips_header_injection_chars(self):
+        result = cli._safe_filename('evil"\r\nX-Injected: yes')
+        assert "\r" not in result
+        assert "\n" not in result
+        assert '"' not in result
+
+    def test_safe_filename_falls_back_when_empty(self):
+        assert cli._safe_filename("") == "file"
+        assert cli._safe_filename("   ") == "file"
+
+    def test_safe_mime_strips_crlf(self):
+        result = cli._safe_mime("text/html\r\nX-Injected: yes")
+        assert "\r" not in result
+        assert "\n" not in result
+
+    def test_explicit_name_with_injection_chars_is_sanitized_end_to_end(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        calls = []
+
+        def fake(url, headers, body):
+            calls.append((url, headers, body))
+            return {"id": "ATT1", "url": "https://trello.com/x"}
+
+        monkeypatch.setattr(cli, "_do_upload", fake)
+        monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
+        f = tmp_path / "f.txt"
+        f.write_text("x")
+        code, _ = _run(
+            ["attach", "CARD", str(f), "--name", 'evil"\r\nX-Injected: yes'], capsys
+        )
+        assert code == 0
+        _, headers, body = calls[-1]
+        # A raw CR/LF in the sanitized name must not have split the header
+        # into an extra line the multipart parser would choke on.
+        fields = _parse_multipart(headers["Content-Type"], body)
+        assert "file" in fields and "name" in fields

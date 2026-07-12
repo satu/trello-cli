@@ -58,6 +58,7 @@ trello create <list> "<name>" [--desc "<body>"]   # create a card
 trello move <card_id> <list>       # move a card to another list
 trello archive <card_id>           # archive (close) a card
 trello download <url> [<path>]     # download an authenticated attachment; omit <path> for a secure temp file (prints its path)
+trello attach <card_id> <path> [--name NAME] [--mime MIME]  # upload a local file as an attachment
 ```
 
 `<list>` is a **list reference**: a 24-char list id, one of the aliases
@@ -106,6 +107,13 @@ stdout for you to capture. This avoids a predictable `/tmp/clip.<ext>` another
 local user could pre-plant as a symlink. You may still pass an explicit path if
 you need one.
 
+Attach a local file to a card:
+
+```bash
+trello attach <card_id> ./index.html                       # name defaults to the basename
+trello attach <card_id> ./report.pdf --name "report.pdf" --mime application/pdf
+```
+
 ## Security notes
 
 - `trello download` requires an OAuth `Authorization` header (the query-string
@@ -118,3 +126,5 @@ you need one.
   fetched uncredentialed, so the token can never leak to it.
 - Card/list/board ids are 24 hex chars; the CLI passes those through untouched,
   and anything else is treated as an alias or list name.
+- `trello attach` also requires the OAuth header (the query-string key/token
+  is rejected for this write); the CLI handles that for you too.

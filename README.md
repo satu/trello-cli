@@ -79,6 +79,7 @@ trello create <list> "<name>" [--desc "<body>"]
 trello move <card_id> <list>
 trello archive <card_id>
 trello download <url> [<path>]     # authenticated attachment download
+trello attach <card_id> <path> [--name NAME] [--mime MIME]  # upload a file as an attachment
 ```
 
 `<list>` is a list id, one of the aliases `todo` / `ready` / `icebox`, or any
