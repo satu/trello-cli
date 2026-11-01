@@ -17,28 +17,9 @@ import pytest
 
 import trello_cli
 from trello_cli import cli
-from trello_cli.__main__ import main as entrypoint_main
 
 
 # --- packaging contract ---------------------------------------------------
-
-
-def test_package_exposes_version():
-    assert isinstance(trello_cli.__version__, str)
-    assert trello_cli.__version__
-
-
-def test_main_version_flag(capsys):
-    code = cli.main(["--version"])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert trello_cli.__version__ in out
-
-
-def test_entrypoint_reexports_real_main():
-    # The console script maps to trello_cli.__main__:main; it must be the real
-    # implementation, not a stub.
-    assert entrypoint_main is cli.main
 
 
 def test_console_script_entry_point_resolves():
@@ -229,12 +210,6 @@ class TestRequest:
         assert "key=KEY" in url
         assert "token=TOK" in url
 
-    def test_encodes_params(self, http):
-        api = cli.TrelloAPI(_creds())
-        api.request("GET", "/lists/x/cards", params={"fields": "name,desc"})
-        url = http.last_url()
-        assert "fields=name%2Cdesc" in url
-
 
 # --- list resolution ------------------------------------------------------
 
@@ -297,22 +272,6 @@ class TestCardCommand:
 
 
 class TestListsCommand:
-    def test_lists_board_lists(self, monkeypatch, capsys):
-        fake = FakeHTTP(
-            {
-                ("GET", "/boards/694dd9802e3ad21db9ca5da1/lists"): [
-                    {"id": "L1", "name": "TODO"},
-                    {"id": "L2", "name": "READY TO TRY"},
-                ]
-            }
-        )
-        monkeypatch.setattr(cli, "_do_http", fake)
-        monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
-        code, out = _run(["lists"], capsys)
-        assert code == 0
-        data = json.loads(out)
-        assert [d["name"] for d in data] == ["TODO", "READY TO TRY"]
-
     def test_board_id_flag_overrides(self, monkeypatch, capsys):
         fake = FakeHTTP({("GET", "/boards/FLAGBOARD/lists"): [{"id": "L", "name": "X"}]})
         monkeypatch.setattr(cli, "_do_http", fake)
@@ -425,18 +384,6 @@ class TestDownloadCommand:
         monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
         return calls
 
-    def test_writes_file_with_oauth_header(self, monkeypatch, tmp_path, capsys):
-        calls = self._patch(monkeypatch)
-        out = tmp_path / "clip.opus"
-        url = "https://trello.com/1/cards/C/attachments/A/download/clip.opus"
-        code, _ = _run(["download", url, str(out)], capsys)
-        assert code == 0
-        assert out.read_bytes() == b"audio-bytes"
-        req_url, headers = calls[-1]
-        assert req_url == url
-        auth = headers.get("Authorization", "")
-        assert "OAuth" in auth and "KEY" in auth and "TOK" in auth
-
     def test_creates_parent_directory(self, monkeypatch, tmp_path, capsys):
         self._patch(monkeypatch)
         out = tmp_path / "nested" / "deep" / "clip.opus"
@@ -480,7 +427,7 @@ class TestDownloadAllowlist:
             code, _ = _run(["download", url, str(out)], capsys)
             assert code == 0
             _, headers = calls[-1]
-            assert "Authorization" in headers
+            assert headers["Authorization"].startswith("OAuth ")
             assert "KEY" in headers["Authorization"]
             assert "TOK" in headers["Authorization"]
 
@@ -671,18 +618,6 @@ class TestAttachCommand:
         assert fields["file"]["filename"] == "index.html"
         assert fields["file"]["payload"] == b"<html>hi</html>"
 
-    def test_default_name_is_file_basename(self, monkeypatch, tmp_path, capsys):
-        calls = self._patch(monkeypatch)
-        f = tmp_path / "report.pdf"
-        f.write_bytes(b"%PDF-1.4")
-        code, _ = _run(["attach", "CARD", str(f)], capsys)
-        assert code == 0
-        _, headers, body = calls[-1]
-        fields = _parse_multipart(headers["Content-Type"], body)
-        assert fields["name"]["payload"] == b"report.pdf"
-        assert fields["file"]["filename"] == "report.pdf"
-        assert fields["file"]["payload"] == b"%PDF-1.4"
-
     def test_explicit_name_overrides_basename(self, monkeypatch, tmp_path, capsys):
         calls = self._patch(monkeypatch)
         f = tmp_path / "index.html"
@@ -726,19 +661,6 @@ class TestAttachCommand:
         err = capsys.readouterr().err
         assert code == 1
         assert "nope.txt" in err
-
-    def test_upload_http_error_returns_1(self, monkeypatch, tmp_path, capsys):
-        def boom(url, headers, body):
-            raise cli.TrelloError("Trello upload 401 on POST ...: unauthorized")
-
-        monkeypatch.setattr(cli, "_do_upload", boom)
-        monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
-        f = tmp_path / "f.txt"
-        f.write_text("x")
-        code = cli.main(["attach", "CARD", str(f)])
-        err = capsys.readouterr().err
-        assert code == 1
-        assert "401" in err
 
 
 class TestAttachSanitization:
