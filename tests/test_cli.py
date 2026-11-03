@@ -1,16 +1,20 @@
 """Tests for the standalone Trello CLI (``trello_cli.cli`` / the ``trello``
 console script).
 
-The HTTP layer (``cli._do_http`` / ``cli._do_download``) is monkeypatched so
-these tests assert on the method/URL each command issues and how it shapes
-output — without ever touching the network.
+The HTTP layer (``cli._do_http`` / ``cli._do_download`` / ``cli._do_upload``)
+is monkeypatched so these tests assert on the method/URL each command issues
+and how it shapes output — without ever touching the network. The seams
+themselves are covered by ``TestNetworkSeams`` via a fake ``urlopen``.
 """
 
 import email
+import io
 import json
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from email import policy
 
 import pytest
@@ -135,12 +139,14 @@ class TestLoadCreds:
         assert creds.api_token == "flattok"
         assert creds.board_id == "brd"
 
-    def test_token_key_alias_in_config(self, tmp_path):
-        # `token` is accepted as an alias for `api_token`.
+    def test_key_aliases_in_config(self, tmp_path):
+        # `token` is accepted as an alias for `api_token`, and `ready_list_id`
+        # for `ready_to_try_list_id`.
         cfg = tmp_path / "config.yaml"
-        cfg.write_text("api_key: k\ntoken: t\n")
+        cfg.write_text("api_key: k\ntoken: t\nready_list_id: rdy\n")
         creds = cli.load_creds(str(cfg))
         assert creds.api_token == "t"
+        assert creds.ready_to_try_list_id == "rdy"
 
     def test_env_overrides_yaml(self, tmp_path, monkeypatch):
         cfg = tmp_path / "config.yaml"
@@ -184,6 +190,49 @@ class TestLoadCreds:
         creds = cli.load_creds()
         assert creds.api_token == "sekret"
 
+    @pytest.mark.parametrize(
+        "env, config",
+        [
+            ({"TRELLO_API_KEY_CMD": "printf cmdkey", "TRELLO_TOKEN": "t"}, ""),
+            ({}, "api_key_cmd: printf cmdkey\napi_token: t\n"),
+            ({"TRELLO_API_KEY": "cmdkey"}, "api_token_cmd: printf t\n"),
+            ({"TRELLO_API_KEY": "cmdkey"}, "token_cmd: printf t\n"),
+        ],
+        ids=["env-key-cmd", "config-api_key_cmd", "config-api_token_cmd", "config-token_cmd"],
+    )
+    def test_secret_command_keys(self, tmp_path, monkeypatch, env, config):
+        # Every *_CMD spelling (env and config) is honoured for its secret.
+        for var, value in env.items():
+            monkeypatch.setenv(var, value)
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(config)
+        creds = cli.load_creds(str(cfg))
+        assert (creds.api_key, creds.api_token) == ("cmdkey", "t")
+
+    def test_env_beats_config_beats_secret_command(self, tmp_path, monkeypatch):
+        # A losing secret command is `false`: if it were run despite a
+        # higher-precedence value, load_creds would raise.
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "api_key: cfgkey\n"
+            "api_key_cmd: 'false'\n"
+            "token_cmd: 'false'\n"
+            "api_token_cmd: 'false'\n"
+        )
+        monkeypatch.setenv("TRELLO_TOKEN", "envtok")
+        monkeypatch.setenv("TRELLO_API_KEY_CMD", "false")
+        creds = cli.load_creds(str(cfg))
+        assert (creds.api_key, creds.api_token) == ("cfgkey", "envtok")
+
+    def test_env_secret_command_beats_config_secret_command(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("api_key: k\napi_token_cmd: 'false'\ntoken_cmd: 'false'\n")
+        monkeypatch.setenv("TRELLO_TOKEN_CMD", "printf envcmdtok")
+        creds = cli.load_creds(str(cfg))
+        assert creds.api_token == "envcmdtok"
+
     def test_secret_command_failure_raises(self, monkeypatch):
         monkeypatch.setenv("TRELLO_API_KEY", "k")
         monkeypatch.setenv("TRELLO_TOKEN_CMD", "false")
@@ -195,6 +244,96 @@ class TestLoadCreds:
         cfg.write_text("trello:\n  board_id: brd\n")
         with pytest.raises(cli.TrelloError):
             cli.load_creds(str(cfg))
+
+
+# --- network seams (_do_http / _do_download / _do_upload) ----------------
+
+
+class FakeUrlopen:
+    """Stands in for ``urllib.request.urlopen``: either raises ``error`` or
+    returns a response whose ``read()`` yields ``body``. No real network."""
+
+    def __init__(self, body=b"", error=None):
+        self.body = body
+        self.error = error
+
+    def __call__(self, req, timeout=None):
+        if self.error is not None:
+            raise self.error
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def _http_error(code=404, msg="Not Found", body=b"card not found"):
+    return urllib.error.HTTPError(
+        "https://api.trello.com/1/x", code, msg, {}, io.BytesIO(body)
+    )
+
+
+class TestNetworkSeams:
+    """The real ``urlopen``-calling seams, exercised through the CLI with a
+    fake ``urlopen``: transport failures must become ``TrelloError`` (exit 1
+    plus a useful stderr message), not a traceback."""
+
+    @pytest.fixture
+    def cmds(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli, "load_creds", lambda *a, **k: _creds())
+        f = tmp_path / "up.txt"
+        f.write_text("x")
+        return {
+            "http": ["card", "CARD"],
+            "download": ["download", "https://trello.com/x", str(tmp_path / "o")],
+            "upload": ["attach", "CARD", str(f)],
+        }
+
+    @pytest.mark.parametrize(
+        "seam, error, expected",
+        [
+            ("http", _http_error(), ["404", "card not found"]),
+            ("download", _http_error(), ["404", "Not Found"]),
+            ("upload", _http_error(), ["404", "card not found"]),
+            ("http", urllib.error.URLError("conn refused"), ["Network error", "conn refused"]),
+            ("download", urllib.error.URLError("conn refused"), ["Network error", "conn refused"]),
+            ("upload", urllib.error.URLError("conn refused"), ["Network error", "conn refused"]),
+        ],
+        ids=[
+            "http-HTTPError", "download-HTTPError", "upload-HTTPError",
+            "http-URLError", "download-URLError", "upload-URLError",
+        ],
+    )
+    def test_transport_errors_exit_1_with_message(
+        self, monkeypatch, capsys, cmds, seam, error, expected
+    ):
+        monkeypatch.setattr(urllib.request, "urlopen", FakeUrlopen(error=error))
+        code = cli.main(cmds[seam])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert err.startswith("error: ")
+        for text in expected:
+            assert text in err
+
+    @pytest.mark.parametrize(
+        "body, expected",
+        [(b"", {}), (b"not json", "not json"), (b'{"id": "C1"}', {"id": "C1"})],
+        ids=["empty", "non-json", "json"],
+    )
+    @pytest.mark.parametrize("seam", ["http", "upload"])
+    def test_response_body_parsing(self, monkeypatch, seam, body, expected):
+        monkeypatch.setattr(urllib.request, "urlopen", FakeUrlopen(body=body))
+        url = f"{cli.TrelloAPI.BASE}/cards/C1"
+        if seam == "http":
+            result = cli._do_http("GET", url)
+        else:
+            result = cli._do_upload(url, {}, b"")
+        assert result == expected
 
 
 # --- request building -----------------------------------------------------
